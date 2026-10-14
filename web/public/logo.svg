@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="SCA Audit">
+  <title>SCA Audit</title>
+  <defs>
+    <linearGradient id="scaShieldGradient" gradientUnits="userSpaceOnUse" x1="32" y1="8" x2="32" y2="58.6">
+      <stop offset="0" stop-color="#8B7BFF"/>
+      <stop offset="1" stop-color="#4F46E5"/>
+    </linearGradient>
+    <!-- The </> code mark is punched out of the shield instead of painted, so the
+         mark keeps its identity on light, dark and single-colour (brightness-0
+         invert) usages alike. -->
+    <mask id="scaShieldCut">
+      <rect width="64" height="64" fill="#ffffff"/>
+      <g fill="none" stroke="#000000" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M24 26 18 34 24 42"/>
+        <path d="M28.5 42.5 35.5 25.5"/>
+        <path d="M40 26 46 34 40 42"/>
+      </g>
+    </mask>
+  </defs>
+  <path d="M15 8 H49 A5 5 0 0 1 54 13 V30 C54 44 46 52.5 36.2 56 Q32 58.6 27.8 56 C18 52.5 10 44 10 30 V13 A5 5 0 0 1 15 8 Z" fill="url(#scaShieldGradient)" mask="url(#scaShieldCut)"/>
+</svg>
