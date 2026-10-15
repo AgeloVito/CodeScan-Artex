@@ -4,8 +4,6 @@
 
 LLM 多 Agent 驱动的 **静态代码审计平台**（Go 后端 + Next.js 前端）
 
-🌐 **在线 Demo**： [https://artex-demo.vercel.app/](https://artex-demo.vercel.app/)
-
 </div>
 
 ---
