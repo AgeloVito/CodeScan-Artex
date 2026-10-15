@@ -6,6 +6,7 @@ import { ChevronDownIcon, ChevronRightIcon, DownloadIcon, InfoIcon, PackageOpenI
 import { toast } from "sonner";
 
 import { LlmRetestPacketView } from "@/components/finding-llm-packet";
+import { FindingPacketComposer } from "@/components/finding-packet-composer";
 import { HttpCodeBlock } from "@/components/http-code-block";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -331,10 +332,21 @@ export function FindingRawPacketPanel({ finding, contextTask }: { finding: Findi
               />
             </div>
           ) : (
-            <p className="px-3 pb-3 text-xs text-muted-foreground">
-              还没有这个接口的复测报文。可让复核 Agent 依据源码补一份，或在此人工补写——不要直接套用别的接口的报文，
-              各接口的路径与传参并不相同。
-            </p>
+            <div className="flex flex-col gap-2 px-3 pb-3">
+              <p className="text-xs text-muted-foreground">
+                还没有这个接口的复测报文。可让复核 Agent 依据源码补一份（复核进行中会调用 save_finding_packet 写入），
+                或在此人工补写——不要直接套用别的接口的报文，各接口的路径与传参并不相同。
+              </p>
+              <div>
+                <FindingPacketComposer
+                  findingId={findingId}
+                  assetId={it.asset_id}
+                  assetLabel={it.label}
+                  contextTask={contextTask}
+                  onChanged={applyPackets}
+                />
+              </div>
+            </div>
           )
         ) : null}
       </div>

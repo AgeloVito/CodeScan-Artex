@@ -215,10 +215,7 @@ export function FindingsTable({
                       <span className="truncate font-medium">{f.name || f.vulnclass || "未分类"}</span>
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
-                    {(f.traffic_count ?? 0) > 0 && (
-                      // 代码审计平台不抓包：只有历史数据还绑着流量时才显示这个徽章。
-                      <Badge variant="outline">流量证据 {f.traffic_count} 条</Badge>
-                    )}
+                    <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
                   </div>
                 </TableCell>
                 <TableCell>

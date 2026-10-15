@@ -230,6 +230,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.migrateRetesterPrompt(); err != nil {
 			log.Printf("[retester] 提示词迁移: %v", err)
 		}
+		if err := s.migrateRetesterPromptPackets(); err != nil {
+			log.Printf("[retester] 报文修订提示词迁移: %v", err)
+		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent

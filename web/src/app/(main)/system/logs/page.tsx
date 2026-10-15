@@ -9,34 +9,13 @@ import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Mock demo：无后端 SSE，塞几行示例日志。
-// 时间用「距今 N 分钟」算出来，而不是写死日期——否则截图与在线 demo 会显示成几个月前的旧日志。
-const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
-
 const MOCK_LOGS: LogLine[] = [
-  { seq: 1, ts: ago(4), level: "info", tag: "engine", text: "SCA Audit v0.1.0 backend listening on :7878 (workers=3)" },
-  { seq: 2, ts: ago(3.9), level: "info", tag: "config", text: "LLM configured from DB: anthropic / claude-opus-4-8" },
-  {
-    seq: 3,
-    ts: ago(2.1),
-    level: "info",
-    tag: "planner",
-    text: "task t-acme-web: 第 3 轮规划，新增意图 i4（接口所需权限的判定依据）",
-  },
-  {
-    seq: 4,
-    ts: ago(1.2),
-    level: "warn",
-    tag: "guard",
-    text: "block Write: 被测源码只读 —— ../source/mall-web/src/main/resources/mapper/ProductMapper.xml 写入被拒，等待人工裁决",
-  },
-  { seq: 5, ts: ago(0.7), level: "info", tag: "work#2", text: "report_finding: SQL Injection (high) 已落库到 t-acme-web" },
-  {
-    seq: 6,
-    ts: ago(0.2),
-    level: "error",
-    tag: "work#9",
-    text: "反编译 com.alibaba:fastjson:1.2.24 超时（>120s），该依赖标记为不可读，可达性结论改由类名索引 + 源码调用点判定",
-  },
+  { seq: 1, ts: "2026-07-26T03:55:00Z", level: "info", tag: "engine", text: "SCA Audit v0.1.0 backend listening on :7878 (workers=3)" },
+  { seq: 2, ts: "2026-07-26T03:55:01Z", level: "info", tag: "config", text: "LLM configured from DB: anthropic / claude-opus-4-8" },
+  { seq: 3, ts: "2026-07-26T03:56:10Z", level: "info", tag: "planner", text: "task t-acme-web: 第 3 轮规划，生成意图 i-4" },
+  { seq: 4, ts: "2026-07-26T03:57:00Z", level: "warn", tag: "guard", text: "block bash: 目标越界 out.evil.example 不在 scope 内" },
+  { seq: 5, ts: "2026-07-26T03:57:30Z", level: "info", tag: "work#1", text: "report_finding: Default Credentials (high) 已落库" },
+  { seq: 6, ts: "2026-07-26T03:58:20Z", level: "error", tag: "work#3", text: "intercept: mysqldump 命中破坏性规则，等待人工审批" },
 ];
 
 const levelTone: Record<LogLine["level"], string> = {
@@ -164,7 +143,7 @@ export default function LogsPage() {
     <div className="flex flex-1 flex-col gap-3">
       <div>
         <h1 className="text-xl font-semibold tracking-tight">系统日志</h1>
-        <p className="text-muted-foreground text-sm">后端实时日志流（planner / worker / 规划引擎 / 依赖索引 / 拦截 …）</p>
+        <p className="text-muted-foreground text-sm">后端实时日志流(planner / worker / 数据库 / 流量 …)</p>
       </div>
       <div className="flex flex-1 flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">

@@ -120,16 +120,6 @@ const DSL_FIELDS: { name: string; desc: string; ops: { op: string; desc: string 
     ],
   },
   {
-    // 代码审计的核心产出：按接口所需权限筛，快速圈出对外暴露面。
-    name: "permission",
-    desc: "接口所需权限：公开/注册用户/登录用户/管理员权限/内部接口/其他",
-    ops: [
-      { op: "=", desc: "模糊匹配" },
-      { op: "==", desc: "精确匹配" },
-      { op: "!=", desc: "排除" },
-    ],
-  },
-  {
     name: "service_type",
     desc: "服务类型：http | other",
     ops: [
@@ -351,7 +341,7 @@ export function AssetDslSearch({
         <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
         <Input
           ref={inputRef}
-          placeholder="DSL 搜索：permission==公开 AND method==POST"
+          placeholder="DSL 搜索：domain=example AND status_code>=400"
           value={query}
           onChange={handleChange}
           onKeyDown={handleKeyDown}

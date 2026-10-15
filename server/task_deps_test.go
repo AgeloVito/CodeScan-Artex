@@ -441,6 +441,15 @@ func TestDependencyToolGuards(t *testing.T) {
 // TestDependencyToolRunawayGuard verifies the cap that keeps "on demand" from
 // degenerating into "decompile everything" during an autonomous run.
 func TestDependencyToolRunawayGuard(t *testing.T) {
+	if maxMaterializedPerTask != 20000 {
+		t.Fatalf("默认单任务上限 = %d, 期望 20000", maxMaterializedPerTask)
+	}
+	// The guard compares against the real default (20000). Shrink it for this test so
+	// we exercise the very same branch without inserting tens of thousands of rows.
+	orig := maxMaterializedPerTask
+	maxMaterializedPerTask = 40
+	t.Cleanup(func() { maxMaterializedPerTask = orig })
+
 	s, pg := depsServer(t)
 	tk, err := pg.CreateTask("依赖上限测试", "验证单任务反编译上限", nil, 0, 0)
 	if err != nil {

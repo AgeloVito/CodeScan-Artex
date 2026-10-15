@@ -1059,7 +1059,7 @@ export default function SkillsPage() {
                 </div>
                 <div className="grid gap-1.5">
                   <Label className="text-muted-foreground text-xs">compatibility</Label>
-                  <Input placeholder="需要 python3、cfr" value={newCompat} onChange={(e) => setNewCompat(e.target.value)} />
+                  <Input placeholder="需要 sqlmap、python3" value={newCompat} onChange={(e) => setNewCompat(e.target.value)} />
                 </div>
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-1.5">

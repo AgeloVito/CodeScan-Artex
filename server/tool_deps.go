@@ -31,10 +31,11 @@ import (
 // =====================================================================
 
 // maxMaterializedPerTask caps how many dependencies an agent may turn into source
-// within one task. This is the guard that keeps on-demand from becoming "decompile
-// the whole .m2": a human can still materialise more from the UI, but an autonomous
-// run cannot spiral (one 1.7 MB jar ≈ 40–60 s).
-const maxMaterializedPerTask = 40
+// within one task. At 20000 it is a sanity bound rather than a working budget: the
+// real brake is that "on demand" costs one deliberate call per jar (one 1.7 MB jar
+// ≈ 40–60 s), and a human can always materialise more from the UI. It stays a var
+// so tests can shrink it instead of materialising tens of thousands of rows.
+var maxMaterializedPerTask = 20000
 
 // depToolNames are the two tool keys, kept in one place so seeding and binding agree.
 var depToolNames = []string{"list_dependencies", "ensure_dependency_source"}

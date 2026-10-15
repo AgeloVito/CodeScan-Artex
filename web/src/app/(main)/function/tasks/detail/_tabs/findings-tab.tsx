@@ -79,10 +79,7 @@ function Row({
             <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
           </div>
         </button>
-        {(f.traffic_count ?? 0) > 0 && (
-          // 代码审计平台不抓包：只有历史数据还绑着流量时才显示这个徽章。
-          <Badge variant="outline">流量证据 {f.traffic_count} 条</Badge>
-        )}
+        <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
         {f.assets && f.assets.length > 0 && (
           <div className="hidden shrink-0 flex-wrap justify-end gap-1 sm:flex">
             {f.assets.slice(0, 2).map((a) => (

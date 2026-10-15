@@ -118,6 +118,33 @@ func (s *Server) packetCoverage(f *db.DBFinding) (map[string]any, error) {
 	return map[string]any{"packets": packets, "interfaces": interfaces}, nil
 }
 
+// packetCoverageSummary 是 packetCoverage 的轻量版：只回「哪个接口有没有报文」，
+// 不带报文正文。agent 工具（复核修订）保存完一份后用它回报剩余缺口——把全部报文
+// 正文再灌回模型上下文既浪费 token，也容易让它把旧报文当成新依据。
+func (s *Server) packetCoverageSummary(f *db.DBFinding) ([]map[string]any, error) {
+	packets, err := s.m.pg.ListFindingPackets(f.ID)
+	if err != nil {
+		return nil, err
+	}
+	interfaces, err := s.findingPacketInterfaces(f)
+	if err != nil {
+		return nil, err
+	}
+	have := make(map[int64]bool, len(packets))
+	for _, p := range packets {
+		if p.AssetID > 0 {
+			have[p.AssetID] = true
+		}
+	}
+	out := make([]map[string]any, 0, len(interfaces))
+	for _, it := range interfaces {
+		out = append(out, map[string]any{
+			"asset_id": it.AssetID, "label": it.Label, "has_packet": have[it.AssetID],
+		})
+	}
+	return out, nil
+}
+
 func (s *Server) listFindingPackets(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.findingTrafficAccess(w, r, false)
 	if !ok {

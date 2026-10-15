@@ -688,7 +688,7 @@ function CustomToolDialog({
         <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
           <div className="grid gap-1.5">
             <Label className="text-xs">Key</Label>
-            <Input className="font-mono" placeholder="如 query_package" value={key} disabled={!isNew}
+            <Input className="font-mono" placeholder="如 nmap_scan" value={key} disabled={!isNew}
               onChange={(e) => setKey(e.target.value)} />
           </div>
           <div className="grid gap-1.5">
@@ -717,7 +717,7 @@ function CustomToolDialog({
 
           {kind === "command" && (
             <div className="grid gap-1.5">
-              <Label className="text-xs">命令模板（占位符 {"{param}"}，如 cfr {"{jar}"} --outputdir {"{out}"}）</Label>
+              <Label className="text-xs">命令模板（占位符 {"{param}"}，如 nmap -p {"{ports}"} {"{target}"}）</Label>
               <Textarea className="font-mono text-xs" rows={2} value={ex.command}
                 onChange={(e) => setEx({ ...ex, command: e.target.value })} />
             </div>

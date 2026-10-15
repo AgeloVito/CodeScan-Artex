@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -416,5 +418,170 @@ func TestMigrateRetesterPromptReplacesLegacyPromptOnce(t *testing.T) {
 	}
 	if got, err := s.m.pg.GetAgentByKey(db.FindingRetestAgentKey); err != nil || got.Name != "我的复核 Agent" {
 		t.Fatalf("迁移覆盖了用户改的名字: %+v err=%v", got, err)
+	}
+}
+
+// retestTool 按名字取复核会话的工具，缺了就失败——工具被误删/改名要在这里炸，
+// 而不是等到线上模型拿不到工具。
+func retestTool(t *testing.T, s *Server, name string) actool.CoreTool {
+	t.Helper()
+	for _, tool := range s.findingRetestTools() {
+		if tool.Name() == name {
+			return tool
+		}
+	}
+	t.Fatalf("复核工具 %s 不存在", name)
+	return nil
+}
+
+// TestSaveFindingPacketToolLifecycle 覆盖复核 Agent 的纠错面：报文修订工具只能写
+// 本会话关联漏洞、只能写它锚定的那个接口、只在本轮复核进行中可写，且重复保存递增
+// revision（人工修订走同一条落库链路）。
+func TestSaveFindingPacketToolLifecycle(t *testing.T) {
+	s, fid := newRetestServer(t)
+	ep, err := s.m.pg.Assets().UpsertEndpoint(db.UpsertEndpointReq{URL: "https://pk.example.com/api/user", Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM assets WHERE id=$1`, ep) })
+	if _, err := s.m.pg.Exec(`UPDATE findings SET asset_ids=$2::jsonb WHERE id=$1`, fid, fmt.Sprintf("[%d]", ep)); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := retestTool(t, s, saveFindingPacketTool)
+	raw := "GET /api/user HTTP/1.1\r\nHost: pk.example.com\r\nCookie: <会话 Cookie>\r\n\r\n"
+	call := func(ctx context.Context, in map[string]any) actool.Result {
+		t.Helper()
+		payload, _ := json.Marshal(in)
+		res, err := tool.Call(ctx, payload, nil)
+		if err != nil {
+			t.Fatalf("工具调用出错: %v", err)
+		}
+		return res
+	}
+
+	// 会话未关联复核记录：与另外两个工具一样拒绝，且不写任何东西。
+	if res := call(t.Context(), map[string]any{"asset_id": ep, "raw_request": raw}); !res.IsError {
+		t.Fatal("未关联复核记录的会话被接受")
+	}
+
+	// 建立并启动一轮复核。
+	r, conv, created, err := s.m.pg.CreateFindingRetest(t.Context(), fid, "")
+	if err != nil || !created {
+		t.Fatalf("创建复核失败: created=%t err=%v", created, err)
+	}
+	if _, err := s.m.pg.StartFindingRetest(t.Context(), r.ID); err != nil {
+		t.Fatal(err)
+	}
+	ctx := intercept.WithConvID(t.Context(), conv.ID)
+
+	// 不属于本漏洞锚定的接口 → 拒绝（挂错接口会让复测打错目标）。
+	if res := call(ctx, map[string]any{"asset_id": ep + 100000, "raw_request": raw}); !res.IsError {
+		t.Fatal("外来 asset_id 被接受")
+	}
+	// 空报文 → 拒绝。
+	if res := call(ctx, map[string]any{"asset_id": ep, "raw_request": "  "}); !res.IsError {
+		t.Fatal("空报文被接受")
+	}
+
+	// 正常写入：落库来源是 llm、生成者是复核 agent，首次 revision=1。
+	if res := call(ctx, map[string]any{"asset_id": ep, "raw_request": raw,
+		"grounded_refs": []string{"src/main/java/com/x/UserController.java:88"}}); res.IsError {
+		t.Fatalf("保存报文失败: %s", res.Flatten())
+	}
+	p, err := s.m.pg.GetFindingPacket(fid, ep)
+	if err != nil || p == nil {
+		t.Fatalf("报文未落库: p=%+v err=%v", p, err)
+	}
+	if p.Source != db.RetestPacketSourceLLM || p.Generator != db.FindingRetestAgentKey || p.Revision != 1 || !p.Valid {
+		t.Fatalf("报文属性不符: source=%s generator=%s revision=%d valid=%t errors=%v",
+			p.Source, p.Generator, p.Revision, p.Valid, p.Validation.Errors)
+	}
+	if p.RawRequest != raw {
+		t.Fatalf("报文正文不符: %q", p.RawRequest)
+	}
+
+	// 同一接口再存一次：覆盖并递增 revision，而不是新增一行。
+	revised := strings.Replace(raw, "GET /api/user", "GET /api/user?id=1", 1)
+	if res := call(ctx, map[string]any{"asset_id": ep, "raw_request": revised}); res.IsError {
+		t.Fatalf("修订报文失败: %s", res.Flatten())
+	}
+	p2, err := s.m.pg.GetFindingPacket(fid, ep)
+	if err != nil || p2 == nil || p2.Revision != 2 || p2.RawRequest != revised {
+		t.Fatalf("修订未覆盖同一行: p=%+v err=%v", p2, err)
+	}
+	if list, err := s.m.pg.ListFindingPackets(fid); err != nil || len(list) != 1 {
+		t.Fatalf("同一接口应只有一份报文: n=%d err=%v", len(list), err)
+	}
+
+	// 复核结束后（结论已封存）不允许再改报文：追问可以解释，不能改产物。
+	if err := s.m.pg.RecordFindingRetestResult(t.Context(), conv.ID, db.VerdictConfirmed, "s", "e"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.FinishFindingRetest(r.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	if res := call(ctx, map[string]any{"asset_id": ep, "raw_request": raw}); !res.IsError {
+		t.Fatal("已结束的复核仍可写报文")
+	}
+}
+
+// TestSeedFindingRetesterBindsPacketTool 老库升级路径：新工具名会被首插种进 tools 表
+// 并绑给 retester，否则模型永远看不到它（SeedTool 是 first-insert-only，改已有工具
+// 的 schema 到不了老库，所以这里刻意用新工具名而不是给旧工具加参数）。
+func TestSeedFindingRetesterBindsPacketTool(t *testing.T) {
+	s, _ := newRetestServer(t)
+	tool, err := s.m.pg.GetTool(saveFindingPacketTool)
+	if err != nil || tool == nil {
+		t.Fatalf("新工具未 seed: %+v err=%v", tool, err)
+	}
+	if !tool.Enabled || !slices.Contains(tool.Agents, db.FindingRetestAgentKey) {
+		t.Fatalf("新工具未启用或未绑定 retester: enabled=%t agents=%v", tool.Enabled, tool.Agents)
+	}
+}
+
+// TestMigrateRetesterPromptAddsPacketTool 提示词迁移只补「没被用户改过」的正文：
+// 老库停在「复核只能读报文」的旧文本上时补上修订说明；用户自定义的提示词不动。
+func TestMigrateRetesterPromptAddsPacketTool(t *testing.T) {
+	s, _ := newRetestServer(t)
+	a, err := s.m.pg.GetAgentByKey(db.FindingRetestAgentKey)
+	if err != nil || a == nil {
+		t.Fatalf("retester agent: %+v err=%v", a, err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.m.pg.SavePrompt(a.ID, agent.RetesterDefaultPrompt, "test restore", "system")
+		_, _ = s.m.pg.Exec(`DELETE FROM settings WHERE key=$1`, settingRetesterPacketsMigrated)
+	})
+
+	// 老库形态：系统写的旧正文（不含新工具名），且迁移标记未落。
+	if _, err := s.m.pg.SavePrompt(a.ID, "旧的复核提示词（还没有报文修订能力）", "内置默认", "system"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.Exec(`DELETE FROM settings WHERE key=$1`, settingRetesterPacketsMigrated); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateRetesterPromptPackets(); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	if got, err := s.m.pg.CurrentPrompt(a.ID); err != nil || !strings.Contains(got, saveFindingPacketTool) {
+		t.Fatalf("迁移未补上报文修订说明: err=%v got=%.120q", err, got)
+	}
+	if v, ok, err := s.m.pg.GetSetting(settingRetesterPacketsMigrated); err != nil || !ok || v != "1" {
+		t.Fatalf("迁移标记未落库: v=%q ok=%t err=%v", v, ok, err)
+	}
+
+	// 用户改过的提示词：清标记强制再跑一次，正文必须原样保留。
+	const edited = "我自己的复核提示词"
+	if _, err := s.m.pg.SavePrompt(a.ID, edited, "user edit", "ui"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.m.pg.Exec(`DELETE FROM settings WHERE key=$1`, settingRetesterPacketsMigrated); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.migrateRetesterPromptPackets(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.m.pg.CurrentPrompt(a.ID); err != nil || got != edited {
+		t.Fatalf("迁移覆盖了用户编辑: err=%v got=%.40q", err, got)
 	}
 }
